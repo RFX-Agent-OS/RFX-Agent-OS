@@ -9,7 +9,7 @@ from flask import Flask
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-# RFX Agent OS. Render token variable can be BOT_TOKEN, TELEGRAM_BOT_TOKEN, or TELEGRAM_TOKEN.
+# RFX Agent OS. Crypto candles use Bybit public API; gold candles use Yahoo Finance. Render token variable can be BOT_TOKEN, TELEGRAM_BOT_TOKEN, or TELEGRAM_TOKEN.
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger("rfx-agent-os")
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
@@ -32,11 +32,11 @@ MARKETS = {
     "zec": {"label": "🟣 زی‌کش (ZECUSDT)", "symbol": "ZECUSDT", "kind": "crypto"},
 }
 TIMEFRAMES = {
-    "1m": {"label": "۱ دقیقه", "binance": "1m", "yahoo": "1m", "range": "1d"},
-    "3m": {"label": "۳ دقیقه", "binance": "3m", "yahoo": "5m", "range": "5d"},
-    "5m": {"label": "۵ دقیقه", "binance": "5m", "yahoo": "5m", "range": "5d"},
-    "15m": {"label": "۱۵ دقیقه", "binance": "15m", "yahoo": "15m", "range": "5d"},
-    "1h": {"label": "۱ ساعت", "binance": "1h", "yahoo": "1h", "range": "1mo"},
+    "1m": {"label": "۱ دقیقه", "bybit": "1", "yahoo": "1m", "range": "1d"},
+    "3m": {"label": "۳ دقیقه", "bybit": "3", "yahoo": "5m", "range": "5d"},
+    "5m": {"label": "۵ دقیقه", "bybit": "5", "yahoo": "5m", "range": "5d"},
+    "15m": {"label": "۱۵ دقیقه", "bybit": "15", "yahoo": "15m", "range": "5d"},
+    "1h": {"label": "۱ ساعت", "bybit": "60", "yahoo": "1h", "range": "1mo"},
 }
 
 def main_menu():
@@ -67,15 +67,28 @@ def timeframe_menu(market_key):
     rows.append([InlineKeyboardButton("⬅️ انتخاب بازار", callback_data="menu_analysis"), InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")])
     return InlineKeyboardMarkup(rows)
 
-def fetch_binance(symbol, interval, limit=120):
-    r = requests.get("https://api.binance.com/api/v3/klines", params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=12)
+def fetch_bybit(symbol, interval, limit=120):
+    """Fetch public spot candles from Bybit V5; no API key is required."""
+    r = requests.get(
+        "https://api.bybit.com/v5/market/kline",
+        params={"category": "spot", "symbol": symbol, "interval": interval, "limit": limit},
+        headers={"User-Agent": "RFX-Agent-OS/1.0"}, timeout=15,
+    )
     r.raise_for_status()
+    payload = r.json()
+    if payload.get("retCode") != 0:
+        raise ValueError(f"Bybit: {payload.get('retMsg', 'خطای دریافت داده')}")
+    rows = (payload.get("result") or {}).get("list") or []
+    # Bybit returns candles newest-first; reverse them for indicator calculations.
     candles = []
-    for row in r.json():
-        candles.append({"time": datetime.fromtimestamp(row[0]/1000, tz=timezone.utc), "open": float(row[1]),
-                        "high": float(row[2]), "low": float(row[3]), "close": float(row[4]), "volume": float(row[5])})
+    for row in reversed(rows):
+        candles.append({
+            "time": datetime.fromtimestamp(int(row[0]) / 1000, tz=timezone.utc),
+            "open": float(row[1]), "high": float(row[2]), "low": float(row[3]),
+            "close": float(row[4]), "volume": float(row[5]),
+        })
     if len(candles) < 30:
-        raise ValueError("داده‌های کافی از منبع بازار دریافت نشد.")
+        raise ValueError("داده‌های کافی از Bybit دریافت نشد؛ نماد ممکن است در بازار اسپات موجود نباشد.")
     return candles
 
 def fetch_gold(tf_key):
@@ -173,7 +186,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _, market_key, tf_key = data.split(":")
             market, tf = MARKETS[market_key], TIMEFRAMES[tf_key]
             await query.edit_message_text(f"⏳ در حال دریافت داده و تحلیل {market['label']} در تایم‌فریم {tf['label']}...")
-            candles = fetch_binance(market["symbol"], tf["binance"]) if market["kind"] == "crypto" else fetch_gold(tf_key)
+            candles = fetch_bybit(market["symbol"], tf["bybit"]) if market["kind"] == "crypto" else fetch_gold(tf_key)
             result = analyze(candles)
             rsi_text = f"{result['rsi']:.1f}" if result["rsi"] is not None else "نامشخص"
             note = "\n⚠️ منبع عمومی طلا کندل ۳ دقیقه واقعی نمی‌دهد؛ داده منبع ۵ دقیقه‌ای است." if market_key == "gold" and tf_key == "3m" else ""
