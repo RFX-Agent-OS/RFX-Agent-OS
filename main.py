@@ -1,255 +1,422 @@
 import os
+import time
 import logging
 import threading
-import asyncio
 from datetime import datetime, timezone
 
 import requests
-from flask import Flask
+from flask import Flask, jsonify
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application, CallbackQueryHandler, CommandHandler, ContextTypes
+)
 
-# RFX Agent OS. Crypto candles use Bybit public API; gold candles use Yahoo Finance. Render token variable can be BOT_TOKEN, TELEGRAM_BOT_TOKEN, or TELEGRAM_TOKEN.
-logging.basicConfig(format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", level=logging.INFO)
-logger = logging.getLogger("rfx-agent-os")
-BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+# ============================================================
+# RFX Agent OS V2.0 — public market data, no trading execution
+# Required Render environment variable: TELEGRAM_BOT_TOKEN
+# ============================================================
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("rfx-agent-os")
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
-web = Flask(__name__)
+HTTP_TIMEOUT = 12
+USER_AGENT = "RFX-Agent-OS/2.0 (market-data-bot)"
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json"})
 
-@web.get("/")
-def health():
-    return {"service": "RFX Agent OS", "status": "running", "bot_token_configured": bool(BOT_TOKEN),
-            "time_utc": datetime.now(timezone.utc).isoformat()}, 200
+app = Flask(__name__)
 
-@web.get("/health")
-def health_check():
-    return {"status": "ok"}, 200
-
-MARKETS = {
-    "gold": {"label": "🥇 طلا (XAUUSD)", "symbol": "XAUUSD=X", "kind": "gold"},
-    "btc": {"label": "₿ بیت‌کوین (BTCUSDT)", "symbol": "BTCUSDT", "kind": "crypto"},
-    "eth": {"label": "♦️ اتریوم (ETHUSDT)", "symbol": "ETHUSDT", "kind": "crypto"},
-    "zec": {"label": "🟣 زی‌کش (ZECUSDT)", "symbol": "ZECUSDT", "kind": "crypto"},
+CRYPTO = {
+    "BTCUSDT": {"name": "Bitcoin (BTC/USDT)", "binance": "BTCUSDT", "bybit": "BTCUSDT",
+                "okx": "BTC-USDT", "gate": "BTC_USDT", "kucoin": "BTC-USDT", "kraken": "XBTUSDT"},
+    "ETHUSDT": {"name": "Ethereum (ETH/USDT)", "binance": "ETHUSDT", "bybit": "ETHUSDT",
+                "okx": "ETH-USDT", "gate": "ETH_USDT", "kucoin": "ETH-USDT", "kraken": "ETHUSDT"},
+    "SOLUSDT": {"name": "Solana (SOL/USDT)", "binance": "SOLUSDT", "bybit": "SOLUSDT",
+                "okx": "SOL-USDT", "gate": "SOL_USDT", "kucoin": "SOL-USDT", "kraken": "SOLUSDT"},
+    "ZECUSDT": {"name": "Zcash (ZEC/USDT)", "binance": "ZECUSDT", "bybit": "ZECUSDT",
+                "okx": "ZEC-USDT", "gate": "ZEC_USDT", "kucoin": "ZEC-USDT", "kraken": "ZECUSDT"},
 }
+
 TIMEFRAMES = {
-    "1m": {"label": "۱ دقیقه", "bybit": "1", "yahoo": "1m", "range": "1d"},
-    "3m": {"label": "۳ دقیقه", "bybit": "3", "yahoo": "5m", "range": "5d"},
-    "5m": {"label": "۵ دقیقه", "bybit": "5", "yahoo": "5m", "range": "5d"},
-    "15m": {"label": "۱۵ دقیقه", "bybit": "15", "yahoo": "15m", "range": "5d"},
-    "1h": {"label": "۱ ساعت", "bybit": "60", "yahoo": "1h", "range": "1mo"},
+    "1m": {"label": "1 دقیقه", "binance": "1m", "bybit": "1", "okx": "1m", "gate": "1m", "kucoin": "1min", "yahoo": "1m"},
+    "3m": {"label": "3 دقیقه", "binance": "3m", "bybit": "3", "okx": "3m", "gate": "3m", "kucoin": "3min", "yahoo": "1m"},
+    "5m": {"label": "5 دقیقه", "binance": "5m", "bybit": "5", "okx": "5m", "gate": "5m", "kucoin": "5min", "yahoo": "5m"},
+    "15m": {"label": "15 دقیقه", "binance": "15m", "bybit": "15", "okx": "15m", "gate": "15m", "kucoin": "15min", "yahoo": "15m"},
+    "1h": {"label": "1 ساعت", "binance": "1h", "bybit": "60", "okx": "1H", "gate": "1h", "kucoin": "1hour", "yahoo": "60m"},
 }
 
-def main_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 تحلیل بازار", callback_data="menu_analysis")],
-        [InlineKeyboardButton("🥇 تحلیل طلا", callback_data="market_gold"), InlineKeyboardButton("₿ تحلیل بیت‌کوین", callback_data="market_btc")],
-        [InlineKeyboardButton("🪙 تحلیل کریپتو", callback_data="menu_crypto"), InlineKeyboardButton("🎯 سیگنال معاملاتی", callback_data="menu_signal")],
-        [InlineKeyboardButton("💰 مدیریت سرمایه", callback_data="menu_risk"), InlineKeyboardButton("⚙️ تنظیمات", callback_data="menu_settings")],
-        [InlineKeyboardButton("❓ راهنما", callback_data="menu_help")],
-    ])
+def get_json(url, params=None):
+    response = SESSION.get(url, params=params, timeout=HTTP_TIMEOUT)
+    response.raise_for_status()
+    return response.json()
 
-def market_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(MARKETS["gold"]["label"], callback_data="market_gold")],
-        [InlineKeyboardButton(MARKETS["btc"]["label"], callback_data="market_btc")],
-        [InlineKeyboardButton(MARKETS["eth"]["label"], callback_data="market_eth"), InlineKeyboardButton(MARKETS["zec"]["label"], callback_data="market_zec")],
-        [InlineKeyboardButton("⬅️ منوی اصلی", callback_data="home")],
-    ])
-
-def timeframe_menu(market_key):
-    keys = list(TIMEFRAMES)
-    rows = []
-    for i in range(0, len(keys), 2):
-        row = [InlineKeyboardButton(TIMEFRAMES[keys[i]]["label"], callback_data=f"analyze:{market_key}:{keys[i]}")]
-        if i + 1 < len(keys):
-            row.append(InlineKeyboardButton(TIMEFRAMES[keys[i+1]]["label"], callback_data=f"analyze:{market_key}:{keys[i+1]}"))
-        rows.append(row)
-    rows.append([InlineKeyboardButton("⬅️ انتخاب بازار", callback_data="menu_analysis"), InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")])
-    return InlineKeyboardMarkup(rows)
-
-def fetch_bybit(symbol, interval, limit=120):
-    """Fetch public spot candles from Bybit V5; no API key is required."""
-    r = requests.get(
-        "https://api.bybit.com/v5/market/kline",
-        params={"category": "spot", "symbol": symbol, "interval": interval, "limit": limit},
-        headers={"User-Agent": "RFX-Agent-OS/1.0"}, timeout=15,
-    )
-    r.raise_for_status()
-    payload = r.json()
-    if payload.get("retCode") != 0:
-        raise ValueError(f"Bybit: {payload.get('retMsg', 'خطای دریافت داده')}")
-    rows = (payload.get("result") or {}).get("list") or []
-    # Bybit returns candles newest-first; reverse them for indicator calculations.
-    candles = []
-    for row in reversed(rows):
-        candles.append({
-            "time": datetime.fromtimestamp(int(row[0]) / 1000, tz=timezone.utc),
-            "open": float(row[1]), "high": float(row[2]), "low": float(row[3]),
-            "close": float(row[4]), "volume": float(row[5]),
-        })
-    if len(candles) < 30:
-        raise ValueError("داده‌های کافی از Bybit دریافت نشد؛ نماد ممکن است در بازار اسپات موجود نباشد.")
-    return candles
-
-def fetch_gold(tf_key):
-    tf = TIMEFRAMES[tf_key]
-    r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X",
-                     params={"interval": tf["yahoo"], "range": tf["range"]},
-                     headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
-    r.raise_for_status()
-    result = r.json().get("chart", {}).get("result")
-    if not result:
-        raise ValueError("منبع داده فعلاً برای طلا اطلاعاتی برنگرداند.")
-    item = result[0]
-    q = item.get("indicators", {}).get("quote", [{}])[0]
-    closes, highs, lows, opens = q.get("close") or [], q.get("high") or [], q.get("low") or [], q.get("open") or []
-    volumes, times = q.get("volume") or [], item.get("timestamp") or []
-    candles = []
-    for i, close in enumerate(closes):
-        if close is None or i >= len(highs) or highs[i] is None or lows[i] is None or i >= len(opens) or opens[i] is None:
+def normalize_rows(rows, source, reverse=False):
+    """Normalize candle rows to dictionaries: time, open, high, low, close, volume."""
+    if reverse:
+        rows = list(reversed(rows))
+    result = []
+    for row in rows:
+        try:
+            # Source adapters pass [timestamp, open, high, low, close, volume].
+            ts, o, h, l, c, v = row[:6]
+            ts = float(ts)
+            # Convert milliseconds to seconds where needed.
+            if ts > 10_000_000_000:
+                ts /= 1000
+            result.append({
+                "time": datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                "open": float(o), "high": float(h), "low": float(l),
+                "close": float(c), "volume": float(v or 0),
+            })
+        except (ValueError, TypeError, IndexError, OverflowError):
             continue
-        candles.append({"time": datetime.fromtimestamp(times[i], tz=timezone.utc) if i < len(times) else datetime.now(timezone.utc),
-                        "open": float(opens[i]), "high": float(highs[i]), "low": float(lows[i]), "close": float(close),
-                        "volume": float(volumes[i] or 0) if i < len(volumes) else 0.0})
-    if len(candles) < 20:
-        raise ValueError("داده‌های کافی برای تحلیل طلا دریافت نشد.")
-    return candles
+    return result
+
+def fetch_binance(symbol, tf):
+    interval = TIMEFRAMES[tf]["binance"]
+    data = get_json("https://api.binance.com/api/v3/klines",
+                    {"symbol": symbol, "interval": interval, "limit": 120})
+    return normalize_rows([[r[0], r[1], r[2], r[3], r[4], r[5]] for r in data], "binance")
+
+def fetch_bybit(symbol, tf):
+    interval = TIMEFRAMES[tf]["bybit"]
+    data = get_json("https://api.bybit.com/v5/market/kline",
+                    {"category": "spot", "symbol": symbol, "interval": interval, "limit": 120})
+    if str(data.get("retCode")) != "0":
+        raise RuntimeError("Bybit API: " + str(data.get("retMsg", "unknown error")))
+    rows = data.get("result", {}).get("list", [])
+    # Bybit returns newest first, and timestamps are milliseconds.
+    return normalize_rows([[r[0], r[1], r[2], r[3], r[4], r[5]] for r in rows], "bybit", reverse=True)
+
+def fetch_okx(symbol, tf):
+    inst = CRYPTO[symbol]["okx"]
+    bar = TIMEFRAMES[tf]["okx"]
+    data = get_json("https://www.okx.com/api/v5/market/candles",
+                    {"instId": inst, "bar": bar, "limit": "120"})
+    if data.get("code") != "0":
+        raise RuntimeError("OKX API: " + str(data.get("msg", "unknown error")))
+    rows = data.get("data", [])
+    # OKX: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
+    return normalize_rows([[r[0], r[1], r[2], r[3], r[4], r[5]] for r in rows], "okx", reverse=True)
+
+def fetch_gate(symbol, tf):
+    pair = CRYPTO[symbol]["gate"]
+    interval = TIMEFRAMES[tf]["gate"]
+    data = get_json("https://api.gateio.ws/api/v4/spot/candlesticks",
+                    {"currency_pair": pair, "interval": interval, "limit": 120})
+    # Gate rows: [timestamp, quote_volume, close, high, low, open, base_volume]
+    rows = [[r[0], r[5], r[3], r[4], r[2], r[6]] for r in data]
+    return normalize_rows(rows, "gate")
+
+def fetch_kucoin(symbol, tf):
+    pair = CRYPTO[symbol]["kucoin"]
+    interval = TIMEFRAMES[tf]["kucoin"]
+    data = get_json("https://api.kucoin.com/api/v1/market/candles",
+                    {"symbol": pair, "type": interval})
+    if data.get("code") != "200000":
+        raise RuntimeError("KuCoin API: " + str(data.get("msg", "unknown error")))
+    rows = data.get("data", [])
+    # KuCoin rows: [time, open, close, high, low, volume, turnover]
+    return normalize_rows([[r[0], r[1], r[3], r[4], r[2], r[5]] for r in rows], "kucoin", reverse=True)
+
+def fetch_crypto(symbol, tf):
+    errors = []
+    providers = [
+        ("Binance", lambda: fetch_binance(CRYPTO[symbol]["binance"], tf)),
+        ("Bybit", lambda: fetch_bybit(CRYPTO[symbol]["bybit"], tf)),
+        ("OKX", lambda: fetch_okx(symbol, tf)),
+        ("Gate.io", lambda: fetch_gate(symbol, tf)),
+        ("KuCoin", lambda: fetch_kucoin(symbol, tf)),
+    ]
+    for name, provider in providers:
+        try:
+            candles = provider()
+            if len(candles) >= 20:
+                log.info("Market data loaded: %s %s from %s (%s candles)", symbol, tf, name, len(candles))
+                return candles[-120:], name
+            errors.append(f"{name}: تعداد کندل ناکافی ({len(candles)})")
+        except Exception as exc:
+            errors.append(f"{name}: {str(exc)[:180]}")
+            log.warning("Provider failed (%s, %s, %s): %s", symbol, tf, name, exc)
+    raise RuntimeError("؛ ".join(errors[-5:]))
+
+def fetch_gold(tf):
+    """Yahoo Finance chart API for XAUUSD=X. It may be unavailable from some hosting regions."""
+    interval = TIMEFRAMES[tf]["yahoo"]
+    range_value = "5d" if interval in ("1m", "5m", "15m") else "1mo"
+    errors = []
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        try:
+            url = f"https://{host}/v8/finance/chart/XAUUSD%3DX"
+            data = get_json(url, {"range": range_value, "interval": interval, "includePrePost": "true"})
+            chart = data.get("chart", {})
+            if chart.get("error"):
+                raise RuntimeError(str(chart["error"]))
+            result = chart.get("result") or []
+            if not result:
+                raise RuntimeError("Yahoo Finance داده‌ای برنگرداند")
+            item = result[0]
+            timestamps = item.get("timestamp") or []
+            q = (item.get("indicators", {}).get("quote") or [{}])[0]
+            rows = []
+            for i, ts in enumerate(timestamps):
+                vals = [q.get(k, [None] * len(timestamps))[i] for k in ("open", "high", "low", "close", "volume")]
+                if any(v is None for v in vals[:4]):
+                    continue
+                rows.append([ts, vals[0], vals[1], vals[2], vals[3], vals[4] or 0])
+            candles = normalize_rows(rows, "yahoo")
+            if len(candles) >= 20:
+                log.info("Gold data loaded from %s (%s candles)", host, len(candles))
+                return candles[-120:], "Yahoo Finance"
+            raise RuntimeError(f"کندل کافی نیست: {len(candles)}")
+        except Exception as exc:
+            errors.append(f"{host}: {str(exc)[:160]}")
+            log.warning("Gold provider failed (%s): %s", host, exc)
+    # Current price fallback only: do not pretend this is enough for candle analysis.
+    try:
+        item = get_json("https://api.gold-api.com/price/XAU")
+        price = float(item.get("price"))
+        raise RuntimeError(
+            f"قیمت لحظه‌ای طلا از منبع جایگزین دریافت شد: {price:.2f}؛ "
+            "اما کندل تاریخی برای تحلیل در دسترس نیست. جزئیات Yahoo: " + "؛ ".join(errors)
+        )
+    except RuntimeError:
+        raise
+    except Exception:
+        raise RuntimeError("داده کندلی طلا دریافت نشد. " + "؛ ".join(errors))
 
 def ema(values, period):
+    if not values:
+        return []
     alpha = 2 / (period + 1)
-    current, out = values[0], []
-    for value in values:
-        current = alpha * value + (1-alpha) * current
-        out.append(current)
+    out = [values[0]]
+    for value in values[1:]:
+        out.append(alpha * value + (1 - alpha) * out[-1])
     return out
 
-def calc_rsi(closes, period=14):
-    if len(closes) <= period:
+def rsi(values, period=14):
+    if len(values) <= period:
         return None
-    changes = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    gains, losses = [max(x, 0) for x in changes], [max(-x, 0) for x in changes]
-    ag, al = sum(gains[:period])/period, sum(losses[:period])/period
+    gains, losses = [], []
+    for i in range(1, len(values)):
+        change = values[i] - values[i - 1]
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
     for i in range(period, len(gains)):
-        ag = (ag*(period-1)+gains[i])/period
-        al = (al*(period-1)+losses[i])/period
-    if al == 0:
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
         return 100.0
-    return 100 - 100/(1 + ag/al)
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
 def analyze(candles):
     closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
     last = closes[-1]
-    e9, e21 = ema(closes, 9)[-1], ema(closes, 21)[-1]
-    e50 = ema(closes, min(50, max(10, len(closes)-1)))[-1]
-    rsi = calc_rsi(closes)
-    recent = candles[-30:]
-    if e9 > e21 and last > e50: trend = "📈 صعودی"
-    elif e9 < e21 and last < e50: trend = "📉 نزولی"
-    else: trend = "↔️ خنثی / نوسانی"
-    if rsi is not None and rsi >= 70: momentum = "اشباع خرید احتمالی"
-    elif rsi is not None and rsi <= 30: momentum = "اشباع فروش احتمالی"
-    else: momentum = "در محدوده میانی"
-    if e9 > e21 and rsi is not None and 40 <= rsi <= 68: bias = "تمایل صعودی؛ منتظر تأیید کندل و مدیریت ریسک بمان."
-    elif e9 < e21 and rsi is not None and 32 <= rsi <= 60: bias = "تمایل نزولی؛ منتظر تأیید کندل و مدیریت ریسک بمان."
-    else: bias = "سیگنال قطعی وجود ندارد؛ بهتر است صبر کنی تا جهت روشن‌تر شود."
-    return {"price": last, "trend": trend, "rsi": rsi, "momentum": momentum,
-            "support": min(c["low"] for c in recent), "resistance": max(c["high"] for c in recent),
-            "bias": bias, "ema9": e9, "ema21": e21, "ema50": e50, "last_time": candles[-1]["time"]}
+    e20 = ema(closes, 20)[-1]
+    e50 = ema(closes, min(50, max(2, len(closes) - 1)))[-1]
+    momentum = (closes[-1] / closes[-6] - 1) * 100 if len(closes) >= 6 and closes[-6] else 0
+    rv = rsi(closes)
+    support = min(lows[-20:])
+    resistance = max(highs[-20:])
+    if last > e20 > e50:
+        trend = "صعودی"
+    elif last < e20 < e50:
+        trend = "نزولی"
+    else:
+        trend = "خنثی / در حال نوسان"
+    if rv is None:
+        rsi_text = "نامشخص"
+    else:
+        rsi_text = f"{rv:.1f}"
+    if rv is not None and rv >= 70:
+        rsi_state = "اشباع خرید احتمالی"
+    elif rv is not None and rv <= 30:
+        rsi_state = "اشباع فروش احتمالی"
+    else:
+        rsi_state = "میانه"
+    if last > resistance * 0.999:
+        structure = "قیمت نزدیک سقف ۲۰ کندل اخیر است؛ شکست هنوز باید تأیید شود."
+    elif last < support * 1.001:
+        structure = "قیمت نزدیک کف ۲۰ کندل اخیر است؛ شکست نزولی نیاز به تأیید دارد."
+    else:
+        structure = "قیمت داخل محدوده ۲۰ کندل اخیر قرار دارد."
+    return {
+        "price": last, "trend": trend, "rsi": rsi_text, "rsi_state": rsi_state,
+        "momentum": momentum, "support": support, "resistance": resistance,
+        "ema20": e20, "ema50": e50, "structure": structure,
+        "last_time": candles[-1]["time"],
+    }
 
-def fmt_price(v):
-    if v >= 1000: return f"{v:,.2f}"
-    if v >= 1: return f"{v:,.4f}"
-    return f"{v:.8f}"
+def fmt_price(value):
+    if value >= 1000:
+        return f"{value:,.2f}"
+    if value >= 1:
+        return f"{value:.4f}"
+    return f"{value:.8f}".rstrip("0").rstrip(".")
+
+def report(title, tf, candles, source):
+    a = analyze(candles)
+    momentum_word = "مثبت" if a["momentum"] > 0 else ("منفی" if a["momentum"] < 0 else "خنثی")
+    return (
+        f"📊 <b>{title}</b>\n"
+        f"⏱ تایم‌فریم: {TIMEFRAMES[tf]['label']}\n"
+        f"💵 آخرین قیمت کندل: <b>{fmt_price(a['price'])}</b>\n"
+        f"📈 روند EMA: <b>{a['trend']}</b>\n"
+        f"⚡ تغییر ۵ کندل: {a['momentum']:+.2f}% ({momentum_word})\n"
+        f"📉 RSI(14): {a['rsi']} — {a['rsi_state']}\n"
+        f"🟢 حمایت تقریبی ۲۰ کندل: <b>{fmt_price(a['support'])}</b>\n"
+        f"🔴 مقاومت تقریبی ۲۰ کندل: <b>{fmt_price(a['resistance'])}</b>\n"
+        f"🧭 ساختار: {a['structure']}\n"
+        f"🕒 زمان آخرین کندل: {a['last_time']}\n"
+        f"🔌 منبع داده: {source}\n\n"
+        "⚠️ این گزارش آموزشی و مبتنی بر داده‌های دریافتی است؛ سیگنال قطعی یا تضمین سود نیست. "
+        "قبل از معامله، اسپرد و قیمت زنده بروکر را بررسی کن."
+    )
+
+def main_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🥇 تحلیل طلا XAUUSD", callback_data="asset:GOLD")],
+        [InlineKeyboardButton("₿ بیت‌کوین BTC", callback_data="asset:BTCUSDT"),
+         InlineKeyboardButton("Ξ اتریوم ETH", callback_data="asset:ETHUSDT")],
+        [InlineKeyboardButton("◎ سولانا SOL", callback_data="asset:SOLUSDT"),
+         InlineKeyboardButton("Ⓩ زی‌کش ZEC", callback_data="asset:ZECUSDT")],
+        [InlineKeyboardButton("🔄 راهنما / شروع مجدد", callback_data="home")],
+    ])
+
+def timeframe_menu(asset):
+    rows = []
+    keys = list(TIMEFRAMES.keys())
+    for i in range(0, len(keys), 3):
+        rows.append([
+            InlineKeyboardButton(TIMEFRAMES[k]["label"], callback_data=f"tf:{asset}:{k}")
+            for k in keys[i:i+3]
+        ])
+    rows.append([InlineKeyboardButton("⬅️ برگشت به بازارها", callback_data="home")])
+    return InlineKeyboardMarkup(rows)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("🤖 به RFX Agent OS خوش آمدی\n\nاز منوی زیر یک وظیفه انتخاب کن.", reply_markup=main_menu())
+    text = (
+        "🤖 <b>RFX Agent OS — نسخه 2.0</b>\n\n"
+        "بازار موردنظر را انتخاب کن. ربات داده‌های عمومی بازار را از چند منبع امتحان می‌کند "
+        "و در صورت خطای یک منبع، سراغ منبع بعدی می‌رود.\n\n"
+        "در این نسخه فقط تحلیل و گزارش انجام می‌شود؛ معامله‌ای اجرا نمی‌شود."
+    )
+    if update.message:
+        await update.message.reply_text(text, reply_markup=main_menu(), parse_mode="HTML")
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=main_menu(), parse_mode="HTML")
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("راهنما:\n• «تحلیل بازار» را بزن و بازار و تایم‌فریم را انتخاب کن.\n• تحلیل شامل EMA، RSI و حمایت/مقاومت تقریبی است.\n• این ابزار تحلیل ساده است و سود یا سیگنال قطعی تضمین نمی‌کند.", reply_markup=main_menu())
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "دستورها:\n/start — منوی اصلی\n/health — وضعیت سرویس\n\n"
+        "بازار و تایم‌فریم را از دکمه‌ها انتخاب کن."
+    )
+
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ ربات فعال است. این فقط وضعیت سرویس را بررسی می‌کند، نه دسترسی لحظه‌ای به همه منابع بازار.")
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data or ""
-    if data == "home":
-        await query.edit_message_text("🏠 منوی اصلی RFX Agent OS", reply_markup=main_menu()); return
-    if data in ("menu_analysis", "menu_crypto"):
-        await query.edit_message_text("بازار موردنظر را انتخاب کن:", reply_markup=market_menu()); return
-    if data.startswith("market_"):
-        key = data.replace("market_", "", 1)
-        if key not in MARKETS:
-            await query.edit_message_text("این بازار شناخته نشد.", reply_markup=main_menu()); return
-        await query.edit_message_text(f"بازار انتخاب‌شده: {MARKETS[key]['label']}\nحالا تایم‌فریم را انتخاب کن:", reply_markup=timeframe_menu(key)); return
-    if data.startswith("analyze:"):
-        market_key, tf_key = "btc", "5m"
+    try:
+        if data == "home":
+            await start(update, context)
+            return
+        if data.startswith("asset:"):
+            asset = data.split(":", 1)[1]
+            if asset == "GOLD":
+                title = "طلا (XAUUSD)"
+            else:
+                title = CRYPTO.get(asset, {}).get("name", asset)
+            await query.edit_message_text(
+                f"بازار انتخاب‌شده: <b>{title}</b>\nتایم‌فریم را انتخاب کن:",
+                reply_markup=timeframe_menu(asset), parse_mode="HTML"
+            )
+            return
+        if data.startswith("tf:"):
+            _, asset, tf = data.split(":", 2)
+            if tf not in TIMEFRAMES:
+                await query.edit_message_text("تایم‌فریم نامعتبر است. /start را بزن.")
+                return
+            await query.edit_message_text(
+                f"⏳ در حال دریافت داده‌های {('طلا' if asset == 'GOLD' else CRYPTO.get(asset, {}).get('name', asset))} "
+                f"در تایم‌فریم {TIMEFRAMES[tf]['label']}...\nلطفاً چند لحظه صبر کن."
+            )
+            if asset == "GOLD":
+                candles, source = fetch_gold(tf)
+                title = "طلا (XAUUSD)"
+            else:
+                if asset not in CRYPTO:
+                    raise RuntimeError("بازار انتخاب‌شده پشتیبانی نمی‌شود.")
+                candles, source = fetch_crypto(asset, tf)
+                title = CRYPTO[asset]["name"]
+            text = report(title, tf, candles, source)
+            await query.edit_message_text(
+                text, reply_markup=timeframe_menu(asset), parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return
+    except Exception as exc:
+        log.exception("Market analysis failed")
+        msg = (
+            "❌ <b>داده‌های بازار بارگذاری نشد.</b>\n\n"
+            f"جزئیات: <code>{str(exc)[:900]}</code>\n\n"
+            "این خطا ممکن است ناشی از محدودیت منطقه‌ای/IP یا در دسترس نبودن API باشد. "
+            "منابع جایگزین امتحان شدند. کمی بعد دوباره تلاش کن."
+        )
         try:
-            _, market_key, tf_key = data.split(":")
-            market, tf = MARKETS[market_key], TIMEFRAMES[tf_key]
-            await query.edit_message_text(f"⏳ در حال دریافت داده و تحلیل {market['label']} در تایم‌فریم {tf['label']}...")
-            candles = fetch_bybit(market["symbol"], tf["bybit"]) if market["kind"] == "crypto" else fetch_gold(tf_key)
-            result = analyze(candles)
-            rsi_text = f"{result['rsi']:.1f}" if result["rsi"] is not None else "نامشخص"
-            note = "\n⚠️ منبع عمومی طلا کندل ۳ دقیقه واقعی نمی‌دهد؛ داده منبع ۵ دقیقه‌ای است." if market_key == "gold" and tf_key == "3m" else ""
-            msg = (f"📊 تحلیل {market['label']}\n⏱ تایم‌فریم: {tf['label']}{note}\n\n"
-                   f"💵 قیمت آخرین کندل: {fmt_price(result['price'])}\n🧭 روند: {result['trend']}\n"
-                   f"📉 RSI(14): {rsi_text} — {result['momentum']}\nEMA 9: {fmt_price(result['ema9'])}\n"
-                   f"EMA 21: {fmt_price(result['ema21'])}\nEMA 50: {fmt_price(result['ema50'])}\n\n"
-                   f"🟢 حمایت تقریبی: {fmt_price(result['support'])}\n🔴 مقاومت تقریبی: {fmt_price(result['resistance'])}\n\n"
-                   f"🧠 برداشت الگوریتم: {result['bias']}\n🕒 آخرین داده: {result['last_time'].strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-                   "⚠️ تحلیل ساده است؛ توصیه مالی یا تضمین سود نیست.")
-            await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 تحلیل دوباره", callback_data=f"analyze:{market_key}:{tf_key}")],
-                [InlineKeyboardButton("⬅️ انتخاب تایم‌فریم", callback_data=f"market_{market_key}")],
-                [InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")]]))
-        except Exception as exc:
-            logger.exception("Market analysis failed")
-            await query.edit_message_text("❌ دریافت داده یا تحلیل ناموفق بود؛ ممکن است منبع موقتاً در دسترس نباشد.\n"
-                f"جزئیات: {str(exc)[:200]}", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 تلاش دوباره", callback_data=f"analyze:{market_key}:{tf_key}")],
-                [InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")]]))
+            await query.edit_message_text(msg, reply_markup=main_menu(), parse_mode="HTML")
+        except Exception:
+            log.exception("Could not send market-data error to Telegram")
+
+@app.get("/")
+def home():
+    return jsonify({"service": "RFX Agent OS", "status": "running", "version": "2.0"})
+
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok", "service": "RFX Agent OS", "version": "2.0"})
+
+async def run_telegram():
+    if not TOKEN:
+        log.error("TELEGRAM_BOT_TOKEN is missing; Telegram bot will not start.")
         return
-    if data == "menu_signal":
-        await query.edit_message_text("🎯 در این نسخه به‌جای سیگنال قطعی، تحلیل روند و RSI ارائه می‌شود. قبل از معامله، حد ضرر و ریسک را بررسی کن.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 شروع تحلیل", callback_data="menu_analysis")],[InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")]])); return
-    if data == "menu_risk":
-        await query.edit_message_text("💰 برای محاسبه حجم معامله باید موجودی، درصد ریسک و فاصله حد ضرر مشخص باشد. فرم محاسبه‌گر هنوز فعال نیست.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")]])); return
-    if data == "menu_settings":
-        await query.edit_message_text("⚙️ تایم‌فریم هنگام تحلیل انتخاب می‌شود. تنظیمات پیشرفته در نسخه بعدی قابل اضافه شدن است.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")]])); return
-    if data == "menu_help":
-        await query.edit_message_text("❓ راهنما: تحلیل بازار ← انتخاب نماد ← انتخاب تایم‌فریم ← مشاهده نتیجه.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")]]))
+    application = Application.builder().token(TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("health", health_cmd))
+    application.add_handler(CallbackQueryHandler(callback_handler))
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(drop_pending_updates=False)
+    log.info("Telegram polling started")
+    try:
+        while True:
+            await __import__("asyncio").sleep(3600)
+    finally:
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
 
-async def text_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("برای اجرای وظایف از دکمه‌های منو استفاده کن. دستور /start منوی اصلی را باز می‌کند.", reply_markup=main_menu())
-
-def run_web():
-    web.run(host="0.0.0.0", port=PORT, use_reloader=False)
-
-async def run_bot():
-    if not BOT_TOKEN:
-        raise RuntimeError("توکن تلگرام پیدا نشد. در Render متغیر BOT_TOKEN یا TELEGRAM_TOKEN را تنظیم کن.")
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_fallback))
-    logger.info("Starting RFX Agent OS Telegram bot with asyncio event loop.")
-    async with app:
-        await app.start()
-        if app.updater is None:
-            raise RuntimeError("Telegram updater is not available.")
-        await app.updater.start_polling(drop_pending_updates=True)
-        try:
-            await asyncio.Event().wait()
-        finally:
-            await app.updater.stop()
-            await app.stop()
-
-def main():
-    threading.Thread(target=run_web, daemon=True).start()
-    asyncio.run(run_bot())
+def bot_thread():
+    import asyncio
+    try:
+        asyncio.run(run_telegram())
+    except Exception:
+        log.exception("Telegram bot thread crashed")
 
 if __name__ == "__main__":
-    main()
+    threading.Thread(target=bot_thread, daemon=True, name="telegram-bot").start()
+    # Render web service health endpoint; Telegram polling runs in background thread.
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
