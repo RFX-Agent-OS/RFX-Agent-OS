@@ -43,11 +43,12 @@ def chat(message):
             input=message.text
         )
         bot.reply_to(message, response.output_text)
-    except Exception:
+    except Exception as e:
+        print("OPENAI ERROR:", repr(e))
         bot.reply_to(
             message,
-            "در اتصال به هوش مصنوعی خطایی رخ داد. "
-            "لطفاً بعداً دوباره تلاش کن."
+            "خطا در هوش مصنوعی رخ داد. "
+            "جزئیات در Logs ثبت شده است."
         )
 
 if RENDER_URL:
